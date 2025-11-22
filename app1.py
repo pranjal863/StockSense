@@ -228,122 +228,112 @@ def make_features(series, window_size=30):
 
 
 
+
 def predict(df, days, model_type="LSTM"):
-    """
-    Predicts future stock closing prices using selected model:
-      - LinearRegression
-      - RandomForestRegressor
-      - XGBoost
-      - LSTM (Deep Learning)
-    
-    Returns:
-      - future predictions list
-      - model metrics (R², MAE)
-      - error message if data insufficient
-    """
-    series = df['Close'].values
+    """Safer predict: trains or loads cached models, returns future list, metrics dict, or error string."""
+    try:
+        series = df['Close'].values.astype(float)
+    except Exception as e:
+        return None, None, f"Data error: {e}"
 
-    # Prevent prediction if not enough data points
     if len(series) < 60:
-        return None, None, "Not enough data to train"
+        return None, None, "Not enough data to train (need >= 60 data points)."
 
-    # Prepare features and labels
     X, y = make_features(series)
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-    model = None
+    try:
+        if model_type == "LSTM":
+            # reshape for LSTM
+            X_train_l = np.expand_dims(X_train, axis=-1)
+            X_test_l = np.expand_dims(X_test, axis=-1)
 
-    # =========================
-    # Classical ML Models
-    # =========================
-    if model_type == "LinearRegression":
-        model = LinearRegression()
+            model = load_keras_model_if_exists("lstm_model")
+            if model is None:
+                from tensorflow.keras.models import Sequential
+                from tensorflow.keras.layers import LSTM, Dense, Dropout
+                model = Sequential([
+                    LSTM(64, return_sequences=True, input_shape=(X_train_l.shape[1], 1)),
+                    Dropout(0.2),
+                    LSTM(32),
+                    Dense(16, activation='relu'),
+                    Dense(1)
+                ])
+                model.compile(optimizer='adam', loss='mae')
+                # use fewer epochs for demo stability
+                model.fit(X_train_l, y_train, epochs=8, batch_size=16, verbose=0)
+                try:
+                    save_keras_model(model, "lstm_model")
+                except Exception:
+                    pass
 
-    elif model_type == "RandomForest":
-        model = RandomForestRegressor(n_estimators=200, random_state=42)
+            y_pred = model.predict(X_test_l).flatten()
+            r2 = r2_score(y_test, y_pred)
+            mae = mean_absolute_error(y_test, y_pred)
 
-    elif model_type == "XGBoost":
-        model = XGBRegressor(
-            n_estimators=300,
-            learning_rate=0.05,
-            max_depth=6,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            random_state=42,
-        )
+            # generate future predictions using rolling window
+            seq = series[-30:].tolist()
+            future = []
+            for _ in range(days):
+                x = np.array(seq[-30:]).reshape(1, 30, 1)
+                next_val = model.predict(x, verbose=0)[0][0]
+                seq.append(next_val)
+                future.append(float(next_val))
+            return future, {'r2': r2, 'mae': mae}, None
 
-    # =========================
-    # Deep Learning Model (LSTM)
-    # =========================
-    elif model_type == "LSTM":
-        # reshape to [samples, timesteps, features]
-        X_train = np.expand_dims(X_train, axis=-1)
-        X_test = np.expand_dims(X_test, axis=-1)
+        else:
+            # classical models
+            if model_type == "LinearRegression":
+                model = LinearRegression()
+            elif model_type == "RandomForest":
+                model = RandomForestRegressor(n_estimators=100, random_state=42)
+            elif model_type == "XGBoost":
+                model = XGBRegressor(n_estimators=100, learning_rate=0.05, random_state=42)
+            else:
+                return None, None, f"Unknown model type: {model_type}"
 
-        model = Sequential([
-            LSTM(64, return_sequences=True, input_shape=(X_train.shape[1], 1)),
-            Dropout(0.2),
-            LSTM(32),
-            Dense(16, activation='relu'),
-            Dense(1)
-        ])
+            saved = load_sklearn_model(model_type.lower())
+            if saved is not None:
+                model = saved
+            else:
+                model.fit(X_train, y_train)
+                try:
+                    save_sklearn_model(model, model_type.lower())
+                except Exception:
+                    pass
 
-        model.compile(optimizer='adam', loss='mae')
-        model.fit(X_train, y_train, epochs=25, batch_size=16, verbose=0)
+            y_pred = model.predict(X_test).flatten()
+            r2 = r2_score(y_test, y_pred)
+            mae = mean_absolute_error(y_test, y_pred)
 
-        # evaluate
-        y_pred = model.predict(X_test).flatten()
-        r2 = r2_score(y_test, y_pred)
-        mae = mean_absolute_error(y_test, y_pred)
+            # predict future using last window
+            seq = series[-30:].tolist()
+            future = []
+            for _ in range(days):
+                x = np.array(seq[-30:]).reshape(1, -1)
+                next_val = model.predict(x)[0]
+                seq.append(next_val)
+                future.append(float(next_val))
+            return future, {'r2': r2, 'mae': mae}, None
 
-        # Predict future
-        seq = series[-30:].tolist()
-        future = []
-        for _ in range(days):
-            x = np.array(seq[-30:]).reshape(1, 30, 1)
-            next_val = model.predict(x, verbose=0)[0][0]
-            seq.append(next_val)
-            future.append(next_val)
-
-        return future, {'r2': r2, 'mae': mae}, None
-
-    # =========================
-    # Train Classical Models
-    # =========================
-    model.fit(X_train, y_train)
-    y_pred = model.predict(X_test)
-    r2 = r2_score(y_test, y_pred)
-    mae = mean_absolute_error(y_test, y_pred)
-
-    # Predict future
-    future = []
-    seq = series[-30:].tolist()
-    for _ in range(days):
-        x = np.array(seq[-30:]).reshape(1, -1)
-        next_val = model.predict(x)[0]
-        seq.append(next_val)
-        future.append(next_val)
-
-    return future, {'r2': r2, 'mae': mae}, None
-
-
-
-
+    except Exception as e:
+        return None, None, f"Model training/prediction failed: {e}"
 
 
 def simulate_strategy(df, buy_date, sell_date):
-    # simple buy-hold simulation between dates
+    # simple buy-hold simulation between dates; returns fraction return or 0.0 on error
     if buy_date is None or sell_date is None:
         return 0.0
-    buy_price = df[df['Date']==buy_date]['Close'].iloc[0]
-    sell_price = df[df['Date']==sell_date]['Close'].iloc[0]
-    return (sell_price - buy_price) / buy_price
-
-
-
-
-
-
+    try:
+        row_buy = df.loc[df['Date'] == buy_date]
+        row_sell = df.loc[df['Date'] == sell_date]
+        if row_buy.empty or row_sell.empty:
+            return 0.0
+        buy_price = float(row_buy['Close'].iloc[0])
+        sell_price = float(row_sell['Close'].iloc[0])
+        return (sell_price - buy_price) / buy_price
+    except Exception:
+        return 0.0
 
 def to_excel_bytes(df):
     from io import BytesIO
@@ -524,10 +514,10 @@ def get_market_overview():
                         'change': change,
                         'ticker': ticker
                     }
-            except:
+            except Exception as e:
                 continue
         return overview_data
-    except:
+    except Exception as e:
         return {}
 
 
@@ -583,7 +573,7 @@ def calculate_risk_metrics(df, ticker):
                 beta = 0
         else:
             beta = 0
-    except:
+    except Exception as e:
         beta = 0
     
     return {
@@ -904,6 +894,58 @@ with st.sidebar:
 # FLOATING SEARCH BAR (with Autocomplete)
 # =============================================
 from data import data
+
+# === Model save/load helpers ===
+import os
+import joblib
+from tensorflow.keras.models import load_model as keras_load_model
+
+MODEL_DIR = "models"
+os.makedirs(MODEL_DIR, exist_ok=True)
+
+def save_sklearn_model(model, model_name):
+    path = os.path.join(MODEL_DIR, f"{model_name}.joblib")
+    joblib.dump(model, path)
+    return path
+
+def load_sklearn_model(model_name):
+    path = os.path.join(MODEL_DIR, f"{model_name}.joblib")
+    if os.path.exists(path):
+        try:
+            return joblib.load(path)
+        except Exception as e:
+            # failed to load, remove corrupted file
+            try:
+                os.remove(path)
+            except Exception as e:
+                pass
+            return None
+    return None
+
+def save_keras_model(model, model_name):
+    path = os.path.join(MODEL_DIR, f"{model_name}_keras")
+    model.save(path)
+    return path
+
+def load_keras_model_if_exists(model_name):
+    path = os.path.join(MODEL_DIR, f"{model_name}_keras")
+    if os.path.exists(path):
+        try:
+            return keras_load_model(path)
+        except Exception:
+            return None
+    return None
+
+# initialize usage stats in session state if using streamlit
+try:
+    import streamlit as _st
+    if 'usage_stats' not in _st.session_state:
+        _st.session_state['usage_stats'] = {'data_requests': 0, 'errors_encountered': 0}
+except Exception:
+    pass
+
+# === End helpers ===
+
 # --- Define the search function ---
 def search_stock(query: str):
     """Return suggestions that match the query."""
